@@ -10,7 +10,7 @@ export default function Footer() {
           <div className="footer-brand">
             <Link to="/" className="footer-logo">
               <div className="footer-logo-mark">D</div>
-              <span>Tik-On</span>
+              <span>D‑LAND</span>
             </Link>
             <p>India's first decentralized real estate marketplace. Own, verify, and trade properties on Algorand blockchain.</p>
             <div className="footer-chips">
@@ -51,7 +51,7 @@ export default function Footer() {
         </div>
 
         <div className="footer-bottom">
-          <p>© 2026 Tik-On Technologies Pvt. Ltd. All rights reserved.</p>
+          <p>© 2026 D‑LAND Technologies Pvt. Ltd. All rights reserved.</p>
           <div className="footer-social">
             <a href="#" aria-label="Twitter"><Send size={15} /></a>
             <a href="#" aria-label="LinkedIn"><Globe size={15} /></a>

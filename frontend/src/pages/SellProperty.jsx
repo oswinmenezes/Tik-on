@@ -2,75 +2,135 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ShieldCheck, CheckCircle, Upload, Building2, Landmark, Info, Zap } from 'lucide-react'
 import { useWallet } from '../context/WalletContext'
-import { mintNFTs } from '../utils/contract'
+import algosdk from 'algosdk'
+import { Buffer } from 'buffer'
 import './SellProperty.css'
 
 export default function SellProperty() {
-  const { wallet, signer, isConnected } = useWallet()
+  const { wallet, isConnected, peraWallet } = useWallet()
   const navigate = useNavigate()
   const [tab, setTab] = useState('flat')
   const [step, setStep] = useState(1) // 1: form, 2: preview, 3: success
   const [submitting, setSubmitting] = useState(false)
-  const [txHash, setTxHash] = useState('')
-  const [mintError, setMintError] = useState('')
+
+  const [tokenResult, setTokenResult] = useState(null)
+  const [verifiedData, setVerifiedData] = useState(null)
 
   // Flat form
-  const [flatForm, setFlatForm] = useState({ reraId: '', flatNo: '', price: '', nftCount: '1', walletAddr: '' })
-  
+  const [flatForm, setFlatForm] = useState({ reraId: '', flatNo: '1', price: '', expiryDays: 7 })
+
   // Land form
-  const [landForm, setLandForm] = useState({ surveyNo: '', price: '', nftCount: '1', walletAddr: '' })
+  const [landForm, setLandForm] = useState({ surveyNo: '', price: '', expiryDays: 7 })
 
-  // Active form helpers
-  const activeForm = tab === 'flat' ? flatForm : landForm
-  const setActiveForm = tab === 'flat' ? setFlatForm : setLandForm
+  // Removed KYC blockers to allow demonstration
 
-  if (!isConnected) {
-    return (
-      <div className="container section text-center">
-        <h2>Please Connect Wallet</h2>
-        <p className="text-gray mt-12 mb-24">You need to connect a Polygon wallet (MetaMask) to sell properties.</p>
-        <button className="btn btn-blue" onClick={() => alert('Use top right connect button')}>Connect Wallet</button>
-      </div>
-    )
-  }
-
-  if (wallet.kyc_status !== 'verified') {
-    return (
-      <div className="container section text-center">
-        <h2>KYC Required</h2>
-        <p className="text-gray mt-12 mb-24">Only verified users can list properties for sale to prevent fraud.</p>
-        <button className="btn btn-primary" onClick={() => navigate('/kyc')}>Complete KYC Now</button>
-      </div>
-    )
-  }
-
-  const handleVerify = (e) => {
+  const handleVerify = async (e) => {
     e.preventDefault()
     setSubmitting(true)
-    setMintError('')
-    setTimeout(() => {
-      setSubmitting(false)
+    try {
+      const isFlat = tab === 'flat'
+      const payload = {
+        rera_id: isFlat ? flatForm.reraId : landForm.surveyNo
+      }
+
+      const response = await fetch('http://127.0.0.1:5000/api/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+
+      const data = await response.json()
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Verification failed')
+      }
+
+      setVerifiedData(data.data)
       setStep(2)
-    }, 1500)
+    } catch (error) {
+      console.error(error)
+      alert(error.message)
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   const handleConfirm = async () => {
     setSubmitting(true)
-    setMintError('')
     try {
-      const n = parseInt(activeForm.nftCount, 10)
-      const targetWallet = activeForm.walletAddr.trim() || wallet.address
-
-      if (isNaN(n) || n < 1 || n > 50) {
-        throw new Error('NFT count must be between 1 and 50')
+      if (!wallet) throw new Error("Please connect a wallet first.")
+      const isFlat = tab === 'flat'
+      const payload = {
+        rera_id: isFlat ? flatForm.reraId : landForm.surveyNo,
+        seller_wallet: wallet.address,
+        price: isFlat ? flatForm.price : landForm.price,
+        expiry_days: isFlat ? flatForm.expiryDays : landForm.expiryDays
       }
 
-      const { tx } = await mintNFTs(signer, targetWallet, n)
-      setTxHash(tx.hash)
+      // Step 1: Initiate Tokenisation
+      const initRes = await fetch('http://127.0.0.1:5000/api/tokenise', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+
+      const initData = await initRes.json()
+
+      if (!initRes.ok || !initData.success) {
+        throw new Error(initData.error || 'Tokenisation failed')
+      }
+
+      const unsignedB64Txns = initData.data.unsigned_txns;
+
+      // Step 2: Decode and Sign with Pera
+      const txnArray = unsignedB64Txns.map(b64Str => {
+        const binaryString = window.atob(b64Str)
+        const txnBytes = new Uint8Array(binaryString.length)
+        for (let i = 0; i < binaryString.length; i++) {
+          txnBytes[i] = binaryString.charCodeAt(i)
+        }
+        return algosdk.decodeUnsignedTransaction(txnBytes)
+      })
+
+      const signParam = txnArray.map(txn => [{ txn: txn, signers: [wallet.address] }])
+      const signedTxnGroup = await peraWallet.signTransaction(signParam)
+
+      const signedTxnsB64 = signedTxnGroup.map(signedBytes => {
+        let binaryResult = ''
+        for (let i = 0; i < signedBytes.byteLength; i++) {
+          binaryResult += String.fromCharCode(signedBytes[i])
+        }
+        return window.btoa(binaryResult)
+      })
+
+      // Step 3: Complete Tokenisation
+      const completePayload = {
+        seller_wallet: wallet.address,
+        signed_txns: signedTxnsB64,
+        asset_ids: initData.data.assets.map(a => a.asset_id),
+        rera_id: payload.rera_id,
+        price: payload.price,
+        expiry_days: payload.expiry_days
+      };
+
+      const compRes = await fetch('http://127.0.0.1:5000/api/tokenise-complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(completePayload)
+      })
+      const compData = await compRes.json()
+
+      if (!compRes.ok || !compData.success) throw new Error(compData.error || 'Failed to complete tokenisation')
+
+      setTokenResult(initData.data)
       setStep(3)
-    } catch (err) {
-      console.error('Minting failed:', err)
-      setMintError(err?.reason || err?.message || 'Transaction failed')
+    } catch (error) {
+      console.error(error)
+      if (error?.data?.type === 'CONNECT_MODAL_CLOSED' || error?.message?.includes('Another transaction in progress')) {
+        alert("Wallet signature error. Please open your Pera Wallet app directly to sign, or wait if it is still loading.")
+      } else {
+        alert('Error tokenising asset: ' + error.message)
+      }
     } finally {
       setSubmitting(false)
     }
@@ -81,22 +141,22 @@ export default function SellProperty() {
       <div className="mk-header">
         <div className="container text-center anim-fade">
           <h1>Sell Property</h1>
-          <p>List your flat or land on Tik-on. Verified via Govt. records and minted on Polygon.</p>
+          <p>List your flat or land on D-LAND. Verified via Govt. records and minted on Algorand.</p>
         </div>
       </div>
 
       <div className="container container-sm anim-fade-1 mt-min-40">
-        
+
         {step === 1 && (
           <div className="card shadow-xl">
             <div className="tabs p-4 m-24">
-              <button 
+              <button
                 className={`tab-btn text-lg py-12 ${tab === 'flat' ? 'active' : ''}`}
                 onClick={() => setTab('flat')}
               >
                 <Building2 size={16} className="inline mr-1" /> Sell Flat / Apartment
               </button>
-              <button 
+              <button
                 className={`tab-btn text-lg py-12 ${tab === 'land' ? 'active' : ''}`}
                 onClick={() => setTab('land')}
               >
@@ -106,63 +166,40 @@ export default function SellProperty() {
 
             <div className="card-body pt-0 pb-32 px-32">
               <form onSubmit={handleVerify}>
-                
+
                 {tab === 'flat' ? (
                   <>
                     <div className="grid-2 mb-16">
                       <div className="form-group">
                         <label className="form-label">RERA Registration ID <span>*</span></label>
-                        <input required type="text" className="form-input" placeholder="e.g. P519000..." value={flatForm.reraId} onChange={e => setFlatForm({...flatForm, reraId: e.target.value})} />
-                      </div>
-                      <div className="form-group">
-                        <label className="form-label">Flat / Unit Number <span>*</span></label>
-                        <input required type="text" className="form-input" placeholder="e.g. B-1204" value={flatForm.flatNo} onChange={e => setFlatForm({...flatForm, flatNo: e.target.value})} />
+                        <input required type="text" className="form-input" placeholder="e.g. P519000..." value={flatForm.reraId} onChange={e => setFlatForm({ ...flatForm, reraId: e.target.value })} />
                       </div>
                     </div>
-                    <div className="form-group mb-16">
-                      <label className="form-label">Asking Price (₹) <span>*</span></label>
-                      <input required type="number" className="form-input text-lg" placeholder="e.g. 15000000" value={flatForm.price} onChange={e => setFlatForm({...flatForm, price: e.target.value})} />
+                    <div className="form-group mb-24">
+                      <label className="form-label">Asking Price (algo) <span>*</span></label>
+                      <input required type="number" className="form-input text-lg" placeholder="e.g. 15000000" value={flatForm.price} onChange={e => setFlatForm({ ...flatForm, price: e.target.value })} />
+                    </div>
+                    <div className="form-group mb-24">
+                      <label className="form-label">Fiat Payment Expiry (Days) <span>*</span></label>
+                      <input required type="number" className="form-input" placeholder="e.g. 7" value={flatForm.expiryDays} onChange={e => setFlatForm({ ...flatForm, expiryDays: e.target.value })} min="1" max="90" />
                     </div>
                   </>
                 ) : (
-                   <>
+                  <>
                     <div className="form-group mb-16">
                       <label className="form-label">Survey Number <span>*</span></label>
-                      <input required type="text" className="form-input" placeholder="e.g. SRV/NAS/..." value={landForm.surveyNo} onChange={e => setLandForm({...landForm, surveyNo: e.target.value})} />
+                      <input required type="text" className="form-input" placeholder="e.g. SRV/NAS/..." value={landForm.surveyNo} onChange={e => setLandForm({ ...landForm, surveyNo: e.target.value })} />
                     </div>
-                    <div className="form-group mb-16">
-                      <label className="form-label">Asking Price (₹) <span>*</span></label>
-                      <input required type="number" className="form-input text-lg" placeholder="e.g. 5000000" value={landForm.price} onChange={e => setLandForm({...landForm, price: e.target.value})} />
+                    <div className="form-group mb-24">
+                      <label className="form-label">Asking Price (algo) <span>*</span></label>
+                      <input required type="number" className="form-input text-lg" placeholder="e.g. 5000000" value={landForm.price} onChange={e => setLandForm({ ...landForm, price: e.target.value })} />
+                    </div>
+                    <div className="form-group mb-24">
+                      <label className="form-label">Fiat Payment Expiry (Days) <span>*</span></label>
+                      <input required type="number" className="form-input" placeholder="e.g. 7" value={landForm.expiryDays} onChange={e => setLandForm({ ...landForm, expiryDays: e.target.value })} min="1" max="90" />
                     </div>
                   </>
                 )}
-
-                {/* ── NFT Minting Options ── */}
-                <div className="grid-2 mb-16">
-                  <div className="form-group">
-                    <label className="form-label">Number of NFTs to Mint <span>*</span></label>
-                    <input 
-                      required 
-                      type="number" 
-                      min="1" 
-                      max="50" 
-                      className="form-input" 
-                      placeholder="e.g. 1" 
-                      value={activeForm.nftCount} 
-                      onChange={e => setActiveForm(prev => ({...prev, nftCount: e.target.value}))} 
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Recipient Wallet Address</label>
-                    <input 
-                      type="text" 
-                      className="form-input" 
-                      placeholder={wallet.short + ' (your wallet)'}
-                      value={activeForm.walletAddr} 
-                      onChange={e => setActiveForm(prev => ({...prev, walletAddr: e.target.value}))} 
-                    />
-                  </div>
-                </div>
 
                 <div className="form-group mb-24">
                   <label className="form-label">Upload Ownership Document (Optional but recommended)</label>
@@ -174,7 +211,7 @@ export default function SellProperty() {
 
                 <div className="alert alert-info mb-24">
                   <Info size={16} />
-                  We will query the government database to verify your ownership using your linked KYC details ({wallet.short}).
+                  We will query the government database to verify your ownership using your linked KYC details ({wallet?.name || 'Anonymous'}).
                 </div>
 
                 <button type="submit" className="btn btn-primary btn-lg w-full justify-center text-lg" disabled={submitting}>
@@ -199,73 +236,59 @@ export default function SellProperty() {
               <div className="grid-2 gap-16 text-sm mb-16">
                 <div>
                   <div className="text-gray uppercase text-xs font-bold mb-4">Location</div>
-                  <div className="font-bold">{tab === 'flat' ? 'Bandra West, Mumbai' : 'Sinnar Taluka, Nashik'}</div>
+                  <div className="font-bold">{verifiedData ? `${verifiedData.location_village}, ${verifiedData.location_district}` : (tab === 'flat' ? 'Bandra West, Mumbai' : 'Sinnar Taluka, Nashik')}</div>
                 </div>
                 <div>
                   <div className="text-gray uppercase text-xs font-bold mb-4">Area</div>
-                  <div className="font-bold">{tab === 'flat' ? '1450 sqft' : '2.5 acres'}</div>
+                  <div className="font-bold">{verifiedData ? `${verifiedData.area_sqft} sqft` : (tab === 'flat' ? '1450 sqft' : '2.5 acres')}</div>
                 </div>
                 <div>
                   <div className="text-gray uppercase text-xs font-bold mb-4">Registered Owner</div>
-                  <div className="font-bold text-success flex items-center gap-4">{wallet.short} <CheckCircle size={12}/></div>
+                  <div className="font-bold text-success flex items-center gap-4">{verifiedData ? verifiedData.owner_name : (wallet?.name || 'Anonymous')} <CheckCircle size={12} /></div>
                 </div>
                 <div>
                   <div className="text-gray uppercase text-xs font-bold mb-4">Asking Price</div>
-                  <div className="font-bold font-display text-lg">₹ {Number(activeForm.price).toLocaleString('en-IN')}</div>
+                  <div className="font-bold font-display text-lg"> {Number(tab === 'flat' ? flatForm.price : landForm.price).toLocaleString('en-IN')}</div>
                 </div>
               </div>
 
               <div className="bg-primary-muted border border-primary-dark p-16 rounded-md">
-                <div className="font-bold text-sm text-primary-deep flex items-center gap-8 mb-8"><Zap size={14}/> Polygon Tokenization Preview</div>
-                <div className="flex justify-between text-xs mb-4"><span className="text-gray">Network</span><span className="font-bold">Polygon (MATIC)</span></div>
-                <div className="flex justify-between text-xs mb-4"><span className="text-gray">Token Standard</span><span className="font-bold">ERC-721 (PropertyNFT)</span></div>
-                <div className="flex justify-between text-xs mb-4"><span className="text-gray">NFTs to Mint</span><span className="font-bold">{activeForm.nftCount}</span></div>
-                <div className="flex justify-between text-xs"><span className="text-gray">Recipient</span><span className="font-bold" style={{fontSize:'0.65rem'}}>{activeForm.walletAddr || wallet.address}</span></div>
+                <div className="font-bold text-sm text-primary-deep flex items-center gap-8 mb-8"><Zap size={14} /> Algorand Tokenization Preview</div>
+                <div className="flex justify-between text-xs mb-4"><span className="text-gray">Network</span><span className="font-bold">Algorand Mainnet</span></div>
+                <div className="flex justify-between text-xs mb-4"><span className="text-gray">Asset Type</span><span className="font-bold">ASA (Fractional: No)</span></div>
+                <div className="flex justify-between text-xs"><span className="text-gray">Smart Contract</span><span className="font-bold">D-LAND Atomic Escrow v2</span></div>
               </div>
             </div>
 
-            {mintError && (
-              <div className="alert alert-danger mb-16" style={{color:'#dc3545', background:'#f8d7da', border:'1px solid #f5c6cb', borderRadius:8, padding:'12px 16px'}}>
-                ⚠️ {mintError}
-              </div>
-            )}
-
             <div className="flex gap-16">
-               <button className="btn btn-outline flex-1 justify-center" onClick={() => { setStep(1); setMintError(''); }} disabled={submitting}>Back</button>
-               <button className="btn btn-primary flex-2 justify-center" onClick={handleConfirm} disabled={submitting}>
-                 {submitting ? <div className="spinner border-dark"/> : 'Confirm & Mint NFT on Polygon'}
-               </button>
+              <button className="btn btn-outline flex-1 justify-center" onClick={() => setStep(1)} disabled={submitting}>Back</button>
+              <button className="btn btn-primary flex-2 justify-center" onClick={handleConfirm} disabled={submitting}>
+                {submitting ? <div className="spinner border-dark" /> : 'Confirm & Tokenize Asset'}
+              </button>
             </div>
           </div>
         )}
 
         {step === 3 && (
           <div className="card shadow-xl p-40 text-center anim-fade">
-             <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-success text-white mb-24 shadow-md">
-               <CheckCircle size={40} />
-             </div>
-             <h2 className="mb-12">Property NFTs Minted on Polygon!</h2>
-             <p className="text-gray mb-16 max-w-md mx-auto">
-               {activeForm.nftCount} NFT{parseInt(activeForm.nftCount) > 1 ? 's' : ''} minted successfully to{' '}
-               <strong style={{wordBreak:'break-all', fontSize:'0.8rem'}}>{activeForm.walletAddr || wallet.address}</strong>
-             </p>
-             {txHash && (
-               <div className="mb-24" style={{background:'#f0f0f0', borderRadius:8, padding:'12px 16px', wordBreak:'break-all', fontSize:'0.8rem'}}>
-                 <strong>Tx Hash:</strong>{' '}
-                 <a 
-                   href={`https://amoy.polygonscan.com/tx/${txHash}`} 
-                   target="_blank" 
-                   rel="noopener noreferrer"
-                   style={{color:'#7c3aed'}}
-                 >
-                   {txHash}
-                 </a>
-               </div>
-             )}
-             <div className="flex justify-center gap-16">
-               <button className="btn btn-outline" onClick={() => navigate('/marketplace')}>View in Marketplace</button>
-               <button className="btn btn-primary" onClick={() => navigate('/activity?tab=listings')}>Manage My Listings</button>
-             </div>
+            <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-success text-white mb-24 shadow-md">
+              <CheckCircle size={40} />
+            </div>
+            <h2 className="mb-12">Property Listed on D-LAND!</h2>
+            <p className="text-gray mb-16 max-w-md mx-auto">
+              Your property token(s) have been minted and locked in the smart contract. Your listing is now public.
+            </p>
+            {tokenResult && (
+              <div className="bg-surface-2 p-16 rounded-lg text-left text-sm mb-32 d-inline-block mx-auto max-w-sm border border-border">
+                <div className="flex justify-between mb-8"><span className="text-gray">IPFS Hash</span> <a href={tokenResult.ipfs_url} target="_blank" rel="noreferrer" className="text-primary hover:underline">{tokenResult.ipfs_hash.slice(0, 8)}...</a></div>
+                <div className="flex justify-between mb-8"><span className="text-gray">Total Flats Minted</span> <span className="font-bold">{tokenResult.no_of_flats}</span></div>
+                <div className="flex justify-between mb-8"><span className="text-gray">Asset IDs</span> <span className="font-bold">{tokenResult.assets.map(a => a.asset_id).join(', ')}</span></div>
+              </div>
+            )}
+            <div className="flex justify-center gap-16">
+              <button className="btn btn-outline" onClick={() => navigate('/marketplace')}>View in Marketplace</button>
+              <button className="btn btn-primary" onClick={() => navigate('/activity?tab=listings')}>Manage My Listings</button>
+            </div>
           </div>
         )}
 
